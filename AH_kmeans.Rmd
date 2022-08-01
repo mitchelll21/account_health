@@ -1,0 +1,550 @@
+---
+title: "Account_Health_Kmeans"
+output: html_document
+date: '2022-07-28'
+---
+
+# Data Prep
+
+### packages and data
+```{r}
+library(data.table)
+library(R.utils)
+library(tidyverse)
+library(aws.s3)
+library(arrow)
+library(bigrquery)
+library(fst)
+library(lubridate)
+library(ggrepel)
+library(BTYDplus)
+library(skimr)
+library(NbClust)
+library(imputeTS)
+library(fastshap)   
+library(MASS)
+library(ISLR)
+library(tree)
+library(dtw)
+library(zoo)
+library(factoextra)
+library(psych)
+
+data <- fread("dat_national.csv.gz")
+```
+
+### EDA
+```{r}
+
+ggplot(data, mapping = aes(p.alive)) +
+  geom_histogram()
+
+ggplot(data, mapping = aes(pV)) +
+  geom_histogram()
+
+ggplot(data, mapping = aes(value.at.risk)) +
+  geom_histogram() +
+  scale_x_continuous(limits = c(0, 50000)) +
+  scale_y_continuous(limits = c(0, 20000))
+
+ggplot(data, mapping = aes(pV)) +
+  geom_histogram() +
+  scale_x_continuous(limits = c(0, 5000000)) +
+  scale_y_continuous(limits = c(0, 10000))
+
+data %>%
+  dplyr::select(c(p.alive, pV, value.at.risk)) %>%
+  describe()
+
+data %>%
+  group_by('cust') %>%
+  dplyr::select(c(p.alive, pV, value.at.risk)) %>%
+  summary()
+
+# obvious major skewness in the data... using 3rd quartile as a cutoff
+# to remove most of the outliers
+```
+
+
+### data slicing
+```{r}
+
+data %>%
+  dplyr::filter(pV <= 6638) -> data_small  #q3 cut off
+
+data_small %>%
+  dplyr::select(c(p.alive, pV, value.at.risk)) %>%
+  summary()
+
+
+ggplot(data_small, mapping = aes(p.alive)) +
+  geom_boxplot()
+
+ggplot(data_small, mapping = aes(pV)) +
+  geom_boxplot()
+
+ggplot(data_small, mapping = aes(value.at.risk)) +
+  geom_boxplot()
+
+
+# original data fourth quartile labeled as 'large'
+data %>%
+  dplyr::filter(pV > 6638 ) ->  data_large
+
+# data frames of size 592,979 (small)
+# and 197,662 (large)
+
+```
+
+
+### small data distributions
+
+```{r}
+ggplot(data_small, mapping = aes(pV)) +
+  geom_boxplot()
+
+ggplot(data_small, mapping = aes(p.alive)) +
+  geom_boxplot()
+
+ggplot(data_small, mapping = aes(value.at.risk)) +
+  geom_boxplot()
+
+
+ggplot(data_small, mapping = aes(pV)) +
+  geom_histogram()
+
+ggplot(data_small, mapping = aes(p.alive)) +
+  geom_histogram()
+
+ggplot(data_small, mapping = aes(value.at.risk)) +
+  geom_histogram()
+
+```
+
+# Clustering
+### clustering prep
+
+```{r}
+data %>%
+  group_by(cust) %>%
+  arrange(desc(start_dt)) %>%
+  head()
+
+current_date <- as.POSIXct('2021-12-26')
+# gets more current date from the df
+
+data_small %>%
+  mutate(diff = interval(current_date, as.POSIXct(start_dt)) %/% weeks(1)) -> data_w
+# finding the difference in time between the current date and when the metrics were taken
+
+# -1 means one week ago, -24 is 24 weeks ago, etc
+
+data_w %>%
+  summarise(unique = unique(diff))
+# checking last command
+
+
+wssplot <- function(data, nc=15, seed=42){
+               wss <- (nrow(data)-1)*sum(apply(data,2,var))
+               for (i in 2:nc){
+                    set.seed(seed)
+                    wss[i] <- sum(kmeans(data, centers=i)$withinss)}
+                plot(1:nc, wss, type="b", xlab="Number of groups",
+                     ylab="Sum of squares within a group")}
+```
+
+We only want weeks -12 - 0 to capture the 13 most recent weeks / quarter
+
+### p.alive clustering
+```{r}
+# p.alive from 2021 Q4
+data_w %>%
+  group_by(cust, diff) %>%
+  dplyr::filter(diff >= -12) %>%
+  arrange(start_dt) %>%
+  pivot_wider(id_cols = c('cust'), names_from = diff, values_from = p.alive, names_prefix = 'alive') -> w_wide
+
+head(w_wide)
+
+set.seed(42)
+
+w_wide %>%
+  ungroup() %>%
+  dplyr::select(-(cust)) -> w_input
+
+sum(is.na(w_input))
+
+w_input <- w_input %>% na_interpolation() 
+
+wssplot(w_input, nc = 20)
+
+# looking for optimal cluster size
+
+```
+
+
+```{r}
+kmeans(w_input, 3, nstart = 20) -> km.mod.palive
+
+
+wtab<- aggregate(w_input, by=list(cluster=km.mod.palive$cluster), mean)
+wtab$size <- km.mod.palive$size
+
+# observing cluster means and sizes
+
+# cluster output
+km.mod.palive
+km.mod.palive$betweenss
+km.mod.palive$totss
+
+# pac graph
+fviz_cluster(km.mod.palive, data = w_input, geom = "point", ellipse.type = "norm", ggtheme = theme_minimal())
+
+
+wtab %>%
+  rename_all(~stringr::str_replace(.,"^alive-","")) %>%
+  rename_all(~stringr::str_replace(.,"^alive","")) %>%
+  mutate(cluster = as.character(cluster)) %>%
+ pivot_longer(cols = (2:14), names_to = 'time') -> w_palive
+
+# pivot to graph
+ 
+
+# need to put time in correct order 
+w_palive$time = factor(w_palive$time, levels = c('12', '11', '10', '9', '8', '7', '6', '5', '4', '3', '2', '1', '0'))
+
+  
+ggplot(w_palive, mapping = aes(x = time, y = value, color = cluster, group = cluster)) +
+  geom_line(size = 1.5) +
+  theme_minimal() +
+  labs(title = 'Changes in mean p.alive across past 13 weeks', x = 'Weeks from Baseline (12/26/2021)', y = 'mean p.alive' )
+
+palive <- bind_cols(km.mod.palive$cluster, w_input)
+glimpse(palive) 
+
+palive %>%
+  rename(cluster = ...1) %>%
+   rename_all(~stringr::str_replace(.,"^alive-","")) %>%
+  rename_all(~stringr::str_replace(.,"^alive","")) %>%
+  mutate(cluster = as.character(cluster)) %>%
+ pivot_longer(cols = (2:14), names_to = 'time') -> palive
+
+palive$time = factor(palive$time, levels = c('12', '11', '10', '9', '8', '7', '6', '5', '4', '3', '2', '1', '0'))
+
+ggplot(palive, mapping = aes(x = time, y = value, color = cluster, group = cluster)) +
+  geom_jitter()+
+  theme_minimal() +
+  labs(title = 'Changes in mean p.alive across past 13 weeks', x = 'Weeks from Baseline (12/26/2021)', y = 'mean p.alive' )
+
+```
+
+
+### Value at Risk
+
+```{r}
+
+data_w %>%
+  group_by(cust, diff) %>%
+  dplyr::filter(diff >= -12) %>%
+  arrange(start_dt) %>%
+  pivot_wider(id_cols = c('cust'), names_from = diff, values_from = value.at.risk, names_prefix = 'risk') -> w_wide.r
+
+head(w_wide.r)
+
+set.seed(42)
+
+w_wide.r %>%
+  ungroup() %>%
+  dplyr::select(-(cust)) -> w_input.r
+
+sum(is.na(w_input.r))
+
+w_input.r <- w_input.r %>% na_interpolation() 
+
+wssplot(w_input, nc = 20)
+
+# looking for optimal cluster size
+
+```
+
+
+```{r}
+kmeans(w_input.r, 3, nstart = 20) -> km.mod.r
+wtabr <- aggregate(w_input.r, by=list(cluster=km.mod.r$cluster), mean)
+wtabr$size <- km.mod.r$size
+
+# observing cluster means and sizes
+
+# cluster output
+km.mod.r
+km.mod.r$betweenss
+km.mod.r$totss
+km.mod.r$tot.withinss
+
+fviz_cluster(km.mod.r, data = w_input.r, geom = "point", ellipse.type = "norm", ggtheme = theme_minimal())
+
+wtabr %>%
+  rename_all(~stringr::str_replace(.,"^risk-","")) %>%
+  rename_all(~stringr::str_replace(.,"^risk","")) %>%
+  mutate(cluster = as.character(cluster)) %>%
+ pivot_longer(cols = (2:14), names_to = 'time') -> w_r
+
+# pivot to graph
+  
+w_r$time = factor(w_r$time, levels = c('12', '11', '10', '9', '8', '7', '6', '5', '4', '3', '2', '1', '0'))
+
+  
+ggplot(w_r, mapping = aes(x = time, y = value, color = cluster, group = cluster)) +
+  geom_line(size = 1.5) +
+  theme_minimal() +
+  labs(title = 'Changes in mean value at risk across past 13 weeks', x = 'Weeks from Baseline (12/26/2021)', y = 'mean value at risk' )
+
+
+risk <- bind_cols(km.mod.r$cluster, w_input.r)
+
+risk %>%
+  rename(cluster = ...1) %>%
+   rename_all(~stringr::str_replace(.,"^risk-","")) %>%
+  rename_all(~stringr::str_replace(.,"^risk","")) %>%
+  mutate(cluster = as.character(cluster)) %>%
+ pivot_longer(cols = (2:14), names_to = 'time') -> risk
+
+risk$time = factor(risk$time, levels = c('12', '11', '10', '9', '8', '7', '6', '5', '4', '3', '2', '1', '0'))
+
+ggplot(risk, mapping = aes(x = time, y = value, color = cluster, group = cluster)) +
+ geom_jitter()+
+  theme_minimal() +
+  labs(title = 'Changes in mean risk across past 13 weeks', x = 'Weeks from Baseline (12/26/2021)', y = 'mean risk' )
+
+ggplot(w_r, mapping = aes(x = time, y = value, color = cluster, group = cluster)) +
+  geom_line(size = 1.5) +
+  theme_minimal() +
+  labs(title = 'Changes in mean value at risk across past 13 weeks', x = 'Weeks from Baseline (12/26/2021)', y = 'mean value at risk' )
+
+```
+
+
+### pV assessment
+
+```{r}
+
+data_w %>%
+  group_by(cust, diff) %>%
+  dplyr::filter(diff >= -12) %>%
+  arrange(start_dt) %>%
+  pivot_wider(id_cols = c('cust'), names_from = diff, values_from = pV, names_prefix = 'pv') -> w_wide.pv
+
+head(w_wide.pv)
+
+set.seed(42)
+
+w_wide.pv %>%
+  ungroup() %>%
+  dplyr::select(-(cust)) -> w_input.pv
+
+sum(is.na(w_input.pv))
+
+w_input.pv <- w_input.pv %>% na_interpolation() 
+
+wssplot(w_input, nc = 20)
+
+```
+
+
+```{r}
+set.seed(35)
+
+kmeans(w_input.pv, 3, nstart = 20) -> km.mod.pv
+wtabpv <- aggregate(w_input.pv, by=list(cluster=km.mod.pv$cluster), mean)
+wtabpv$size <- km.mod.pv$size
+# observing cluster means and sizes
+
+# cluster output
+km.mod.pv
+km.mod.pv$betweenss
+km.mod.pv$totss
+km.mod.pv$tot.withinss
+
+# pac plot
+fviz_cluster(km.mod.pv, data = w_input.pv, geom = "point", ellipse.type = "norm", ggtheme = theme_minimal())
+
+wtabpv %>%
+  rename_all(~stringr::str_replace(.,"^pv-","")) %>%
+  rename_all(~stringr::str_replace(.,"^pv","")) %>%
+  mutate(cluster = as.character(cluster)) %>%
+ pivot_longer(cols = (2:14), names_to = 'time') -> w_pv
+
+# pivot to graph
+  
+w_pv$time = factor(w_pv$time, levels = c('12', '11', '10', '9', '8', '7', '6', '5', '4', '3', '2', '1', '0'))
+
+  
+ggplot(w_pv, mapping = aes(x = time, y = value, color = cluster, group = cluster)) +
+  geom_line(size = 1.5) +
+  theme_minimal() +
+  labs(title = 'Changes in mean pV across past 13 weeks', x = 'Weeks from Baseline (12/26/2021)', y = 'mean pV' )
+
+
+pv <- bind_cols(km.mod.pv$cluster, w_input.pv)
+
+pv %>%
+  rename(cluster = ...1) %>%
+   rename_all(~stringr::str_replace(.,"^pv-","")) %>%
+  rename_all(~stringr::str_replace(.,"^pv","")) %>%
+  mutate(cluster = as.character(cluster)) %>%
+ pivot_longer(cols = (2:14), names_to = 'time') -> pv
+
+pv$time = factor(pv$time, levels = c('12', '11', '10', '9', '8', '7', '6', '5', '4', '3', '2', '1', '0'))
+
+ggplot(pv, mapping = aes(x = time, y = value, color = cluster, group = cluster)) +
+ geom_jitter()+
+  theme_minimal() +
+  labs(title = 'Changes in mean pV across past 13 weeks', x = 'Weeks from Baseline (12/26/2021)', y = 'pV' )
+
+ggplot(w_pv, mapping = aes(x = time, y = value, color = cluster, group = cluster)) +
+  geom_line(size = 1.5) +
+  theme_minimal() +
+  labs(title = 'Changes in mean pV across past 13 weeks', x = 'Weeks from Baseline (12/26/2021)', y = 'mean pV' )
+
+```
+
+### clust combos
+```{r}
+
+w_wide$a.cluster <- km.mod.palive$cluster
+
+w_wide %>%
+  rename_all(~stringr::str_replace(.,"^alive-","")) %>%
+  rename_all(~stringr::str_replace(.,"^alive","")) %>%
+  mutate(a.cluster = as.character(a.cluster)) %>%
+ pivot_longer(cols = (2:14), names_to = 'time') %>%
+  rename(p.alive = value) -> w_wide2
+
+w_wide.r$r.cluster <- km.mod.r$cluster
+
+w_wide.r %>%
+  rename_all(~stringr::str_replace(.,"^risk-","")) %>%
+  rename_all(~stringr::str_replace(.,"^risk","")) %>%
+  mutate(r.cluster = as.character(r.cluster)) %>%
+ pivot_longer(cols = (2:14), names_to = 'time') %>%
+  rename(risk = value) -> w_wide.r2
+
+w_wide.pv$p.cluster <- km.mod.pv$cluster
+
+w_wide.pv %>%
+  rename_all(~stringr::str_replace(.,"^pv-","")) %>%
+  rename_all(~stringr::str_replace(.,"^pv","")) %>%
+  mutate(p.cluster = as.character(p.cluster)) %>%
+ pivot_longer(cols = (2:14), names_to = 'time') %>%
+  rename(pv = value) -> w_wide.pv2
+
+
+inner_join(w_wide2, w_wide.r2, by = c('cust', 'time')) %>%
+  inner_join(w_wide.pv2, by = c('cust', 'time')) -> wide.all
+
+head(wide.all)
+
+wide.all %>%
+  mutate(a.cluster = as.character(a.cluster), r.cluster = as.character(r.cluster), pv.cluster = as.character(p.cluster)) -> wide.all
+
+wide.all %>%
+  mutate(cluster = paste(a.cluster, r.cluster, pv.cluster, sep = "")) -> wide.all
+
+
+wide.all %>%
+  dplyr::select(c('cust', 'cluster')) -> clusters.all
+
+
+clusters.all %>%
+  summarise(unique = unique(cluster))
+
+
+wide.all %>%
+  group_by(cluster) %>%
+  count(cluster) %>%
+  arrange(desc(n)) -> clust_count
+
+
+#write.csv(clust_count, "clust_count.csv", row.names = FALSE)
+
+```
+
+# Percentiles
+
+### percentiles p.alive
+```{r}
+
+palive %>%
+  group_by(time, cluster) %>%
+  summarise(x = round(quantile(value, probs = seq(.01, .99, by = .01)), 3), q = seq(.01, .99, by = .01)) %>%
+  as.data.frame() -> quart.palive
+
+
+quart.palive %>%
+  group_by(q) %>%
+  pivot_wider(names_from = q, values_from = x) %>%
+  dplyr::filter(time == '0')
+
+quart.palive %>%
+  group_by(q) %>%
+  pivot_wider(names_from = q, values_from = x) %>%
+  dplyr::filter(time == '0')
+
+
+```
+
+
+### percentiles pV
+```{r}
+
+pv %>%
+  group_by(time, cluster) %>%
+  summarise(x = round(quantile(value, probs = seq(.01, .99, by = .01)), 3), q = seq(.01, .99, by = .01)) %>%
+  as.data.frame() -> quart.pv
+
+
+quart.pv %>%
+  group_by(q) %>%
+  pivot_wider(names_from = q, values_from = x) %>%
+  dplyr::filter(time == '0')
+
+quart.pv %>%
+  group_by(q) %>%
+  pivot_wider(names_from = q, values_from = x) %>%
+  dplyr::filter(time == '0')
+
+
+ggplot(quart.pv, mapping = aes(q, x, color = cluster)) +
+  geom_line() +
+  facet_wrap(~time)
+
+
+```
+
+
+### percentiles risk
+```{r}
+
+risk %>%
+  group_by(time, cluster) %>%
+  summarise(x = round(quantile(value, probs = seq(.01, .99, by = .01)), 3), q = seq(.01, .99, by = .01)) %>%
+  as.data.frame() -> quart.risk
+
+
+quart.risk %>%
+  group_by(q) %>%
+  pivot_wider(names_from = q, values_from = x) %>%
+  dplyr::filter(time == '0')
+
+quart.risk %>%
+  group_by(q) %>%
+  pivot_wider(names_from = q, values_from = x) %>%
+  dplyr::filter(time == '0')
+
+
+ggplot(quart.risk, mapping = aes(q, x, color = cluster)) +
+  geom_line() +
+  facet_wrap(~time)
+
+
+```
