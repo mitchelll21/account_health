@@ -37,7 +37,8 @@ data <- fread("dat_national.csv.gz")
 ```{r}
 
 ggplot(data, mapping = aes(p.alive)) +
-  geom_histogram()
+  geom_histogram() +
+  theme_minimal()
 
 ggplot(data, mapping = aes(pV)) +
   geom_histogram()
